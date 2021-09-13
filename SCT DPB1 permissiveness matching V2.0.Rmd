@@ -1,0 +1,129 @@
+bin---
+title: "SCT DPB1 permissiveness matching V2.0"
+output: html_notebook
+---
+```{r}
+#Loading libraries. 
+library(tidyverse)
+library(httr)
+```
+
+```{r}
+#Load HistoTrac tables.
+(Patient <- readRDS(file = "Patient.rds"))
+(PatientCase <- readRDS(file = "PatientCase.rds"))
+(RelatedPatient <- readRDS(file = "RelatedPatient.rds"))
+```
+
+```{r}
+#Generate a simplified patient table. 
+(Simple_patients <- Patient 
+   %>% filter(PatientTypeCd == "Patient")
+   %>% select(PatientId, HospitalID, firstnm, lastnm, DOB, categoryCd: GenderCd, PatientTypeCd, mA1Cd:mDPB12cd, StatusCd, UnacceptAntigenTxt, mA1EqCd, mDPB12EqCd, UNOSCPRAAmt, UNOSUnacceptAntigenTxt)
+      )
+
+#Generate a simplified donor table.
+(Simple_donors <- Patient 
+   %>% filter(PatientTypeCd == "Donor")
+   %>% select(PatientId, HospitalID, firstnm, lastnm, DOB, categoryCd: GenderCd, PatientTypeCd, mA1Cd:mDPB12cd, StatusCd, UnacceptAntigenTxt, mA1EqCd, mDPB12EqCd, UNOSCPRAAmt, UNOSUnacceptAntigenTxt)
+      )
+
+#Select BMT patients with high-resolution  DPB1 typing
+(BMT_patients <- Simple_patients 
+   %>% filter(categoryCd == "Bone Marrow")
+   %>% filter (str_detect(mDPB11cd, ':'))
+      )
+
+#Select BMT donors with high-resolution DPB1 typing
+(BMT_donors <- Simple_donors 
+   %>% filter(categoryCd == "NMDP BMD" | categoryCd == "Bone Marrow")
+   %>% filter (str_detect(mDPB11cd, ':'))
+      )
+```
+
+```{r}
+#Copy typing from first allele at DPB1 to second in cases of homozygosity. This will ensure accurate matching.
+(BMT_patients_full <- BMT_patients
+   %>% mutate(across(where(is.character), ~na_if(., "")))
+   %>% mutate(mDPB12cd = coalesce(mDPB12cd, mDPB11cd))
+   )
+
+(BMT_donors_full <- BMT_donors
+   %>% mutate(across(where(is.character), ~na_if(., "")))
+   %>% mutate(mDPB12cd = coalesce(mDPB12cd, mDPB11cd))
+   )
+```
+
+```{r}
+#Link donors to recipients. This links patients with the PatientCase table, then the RelatedPatient table, then to the BMT_donors_full table. This will add new rows whenever a patient has a donor.  
+(linked_cases <- BMT_patients_full 
+   %>% left_join(PatientCase, by = "PatientId") 
+   %>% left_join(RelatedPatient, by = "CaseId") 
+   %>% left_join(BMT_donors_full, by= c("RelatedPatientID" = "PatientId"), suffix = c(".recipient", ".donor"))
+   %>% select(PatientId:mDPB12cd.recipient, RelationshipTypeCd, HospitalID.donor:categoryCd.donor, RaceCd.donor:GenderCd.donor, mA1Cd.donor:StatusCd)
+   %>% filter(!is.na(mA1Cd.donor))
+    )
+```
+
+```{r}
+#Determine mismatched DPB1 alleles. 
+
+#The mutate function makes new columns for mismatches at each locus in both directions. For the first line of code, the code makes a new column called "DPB1.1.HvG," and then looks at the value of "mDPB11cd.donor" to see if it is present in either "mDPB11cd.recipient" or "mDPB12cd.recipient." If it finds the value in either, then it records "NA" in "DPB1.1.HvG." The "TRUE" argument copies the value of "mDPB11cd.donor" whenever that value is not found in either of the recipient columns. An easier way to understand this is to see that "case_when" is similar to "if_else:" if the value of "mDPB11cd.donor" is found in either "mDPB11cd.recipient" or "mDPB12cd.recipient," then record "NA," else, copy the value of "mDPB11cd.donor."
+
+(BMT_cases_MM <- linked_cases 
+   %>% mutate(DPB1.1.HvG = case_when(mDPB11cd.donor == mDPB11cd.recipient | mDPB11cd.donor == mDPB12cd.recipient ~ NA_character_, TRUE ~ as.character(mDPB11cd.donor))) 
+   %>% mutate(DPB1.2.HvG = case_when(mDPB12cd.donor == mDPB11cd.recipient | mDPB12cd.donor == mDPB12cd.recipient ~ NA_character_, TRUE ~ as.character(mDPB12cd.donor)))
+   %>% mutate(DPB1.1.GvH = case_when(mDPB11cd.recipient == mDPB11cd.donor | mDPB11cd.recipient == mDPB12cd.donor ~ NA_character_, TRUE ~ as.character(mDPB11cd.recipient)))
+   %>% mutate(DPB1.2.GvH = case_when(mDPB12cd.recipient == mDPB11cd.donor | mDPB12cd.recipient == mDPB12cd.donor ~ NA_character_, TRUE ~ as.character(mDPB12cd.recipient)))
+   )
+
+#Count matches at DPB1.
+#Since the columns "DPB1.1.HvG," etc. list mismatched alleles, then matches show up as "NA." Therefore, counting "NA" values will yield matches. A single, bi-directional mismatch at a locus will show up once in the HvG column, and once in the GvH column (for the donor and recipient mismatches, respectively), so the total number of matches has to be divided by 2 to result in the match number. For unidirectional mismatches, only 1 mismatched allele will show up, and there will be an extra "NA" value, which, when divided by 2, with result in a number (either 0.5 or 1.5) that is not an integer. The "floor" function rounds these numbers down, resulting in appropriate counting of matches for unidirectional mismatches.
+
+(BMT_cases_MM_matches <- BMT_cases_MM
+   %>% mutate(DPB1_matches = as.integer(floor((is.na(DPB1.1.HvG) + is.na(DPB1.2.HvG) + is.na(DPB1.1.GvH) + is.na(DPB1.2.GvH)) / 2)))
+   )
+```
+
+```{r}
+#Calculate DPB1 permissiveness for DPB1 mismatches. Instead of hard-coding DPB1 permissiveness, the code uses the online DPB1 T-Cell Epitope Algorithm v2.0 tool hosted by the IMGT (https://www.ebi.ac.uk/ipd/imgt/hla/dpb_v2.html). While this is slower, as the code has to request and wait for responses from the web, the IMGT's tool is continually updated with new DPB1 alleles, and therefore should be future-proof. This code will determine if a DPB1 mismatch is permissive or non-permissive as long as the IMGT tool is working.
+
+#Note that the online TCE tool will report DPB1 matches as "permissive," so the code first filters out matches before running the TCE tool. This speeds things up, as the code is not asking the IMGT website to perform TCE matching on donors that are DPB1 matched.
+
+#Note that depending on the size of your data set, querying the IMGT website could take a long time, and could even hang. To perform this in chunks, you can remove the # from in front of the "slice" function, which takes the first 100 rows. This can then be done in batches, changing the slice function to slice(101:200), etc.
+
+(DPB1_permisive_a <- BMT_cases_MM_matches 
+   %>% filter(DPB1_matches<2)
+   #%>% slice(1:100)
+   %>% mutate(url = str_glue(
+      "https://www.ebi.ac.uk/cgi-bin/ipd/imgt/hla/dpb_v2.cgi?pid=1&patdpb1={mDPB11cd.recipient}", 
+      "&patdpb2={mDPB12cd.recipient}", 
+      "&did=2&dondpb1={mDPB11cd.donor}", 
+      "&dondpb2={mDPB12cd.donor}"))
+   %>% mutate(result = map(url, GET))
+   %>% mutate(converted = map(result, content, as = "text")) 
+   %>% mutate(converted = as.character(converted))
+   %>% mutate(TCE_result = str_extract(converted, '"tce_prediction".*'))
+   %>% mutate(TCE_result = str_replace(TCE_result, '"tce_prediction" : ', ""))
+   %>% mutate(TCE_result = str_replace_all(TCE_result, '"', ""))
+   %>% mutate(Permissive = str_detect(TCE_result, "^Permissive"))
+   )
+
+#Recording GvH or HvG of the non-permissive mismatches was done separately so that the final table would only have values for DPB1 permissiveness if it was mismatched at DPB1, and then would only have values for GvH or HvG if it was a non-permissive mismatch.
+
+(DPB1_permisive_b <- DPB1_permisive_a
+   %>% filter(Permissive==FALSE)
+   %>% mutate(NP_HvG = (str_detect(converted, "HvG")))
+   %>% mutate(NP_GvH = (str_detect(converted, "GvH")))
+   %>% select(-url, -result, -converted)
+)
+
+#The tables are then joined together.
+(DPB1_permisive <- BMT_cases_MM_matches 
+   %>% left_join(DPB1_permisive_a)
+   %>% left_join(DPB1_permisive_b)
+   %>% select(-url, -result, -converted)
+   )
+
+#The "TCE_result" column is the result returned from the online IMGT TCE tool. "Permissive" translates this to a logical TRUE/FALSE value, and then the columns "NP_HvG," and "NP_GvH," have TRUE/FALSE values for the non-permissive mismatches, as appropriate.
+```
